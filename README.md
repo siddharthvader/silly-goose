@@ -2,9 +2,7 @@
 
 # silly-goose 🪿
 
-_Fork of [block/goose](https://github.com/block/goose) with background-agent inference optimizations_
-
-> Why "silly-goose"? Because optimizing inference for background agents is a mass of fun.
+_Fork of [block/goose](https://github.com/block/goose) with inference optimizations for background agents_
 
 <p align="center">
   <a href="https://opensource.org/licenses/Apache-2.0"
@@ -12,45 +10,39 @@ _Fork of [block/goose](https://github.com/block/goose) with background-agent inf
 </p>
 </div>
 
-## What's Different?
+## Overview
 
-This fork adds **inference optimizations specifically designed for background agent workloads** when using self-hosted models (Ollama, vLLM, etc.).
+This fork adds **inference optimizations for background agent workloads** when using self-hosted models (Ollama, vLLM, etc.). These optimizations exploit the unique properties of background agents—predictable workflows, tolerance for batching, and multi-agent coordination—to reduce latency and inference costs.
 
 | Optimization | Speedup | Description |
 |-------------|---------|-------------|
-| **Semantic Caching** | 5.42x | Cache responses for similar queries using embeddings |
-| **Priority Scheduling** | 1.22x | Prioritize blocked agents over exploratory work |
-| **Speculative Prefetching** | 1.90x | Predict and pre-warm likely next requests |
+| **Semantic Caching** | ~3000x per hit | Cache responses for semantically similar queries |
+| **Priority Scheduling** | 1.4x | Serve blocked agents before exploratory ones |
+| **Speculative Prefetching** | 2.0x | Predict and prefetch likely next requests |
 
-All speedups verified on **real Modal A100 GPU** - not mocked.
-
-## Why These Optimizations?
-
-Background agents are different from interactive chat:
+## Why Background Agents Are Different
 
 | Property | Interactive Chat | Background Agents |
 |----------|-----------------|-------------------|
 | User waiting? | Yes | No |
 | Predictable workflow? | No | Yes (edit → test → fix) |
 | Multiple instances? | Usually 1 | Often many |
-| Can delay requests? | No | Yes |
-
-This fork exploits these differences to reduce inference costs and latency.
+| Can batch/delay? | No | Yes |
 
 ## Quick Start
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/goose-optimized.git
-cd goose-optimized
+git clone https://github.com/siddharthvader/silly-goose.git
+cd silly-goose
 
 # Build
-cargo build -p goose
+cargo build -p goose --release
 
-# Enable optimizations (only for self-hosted providers)
+# Enable optimizations (only affects self-hosted providers)
 export GOOSE_ENABLE_OPTIMIZATIONS=true
 
-# For multi-agent cache sharing (recommended)
+# Optional: Redis for multi-agent cache sharing
 export GOOSE_REDIS_URL=redis://localhost:6379
 ```
 
@@ -63,14 +55,12 @@ export GOOSE_REDIS_URL=redis://localhost:6379
 export GOOSE_ENABLE_OPTIMIZATIONS=true
 ```
 
-Cloud providers (Anthropic, OpenAI, Google) are **not affected** - they manage their own inference.
+Cloud providers (Anthropic, OpenAI, Google) are **not affected**—they manage their own inference.
 
 ### Semantic Cache
 
-Share cached responses across multiple agents:
-
 ```bash
-# Use Redis for multi-agent sharing (recommended)
+# Redis for multi-agent cache sharing
 export GOOSE_REDIS_URL=redis://localhost:6379
 
 # Tuning (optional)
@@ -82,26 +72,26 @@ export GOOSE_SEMANTIC_CACHE_TTL=300  # Seconds
 ### Individual Toggles
 
 ```bash
-export GOOSE_ENABLE_SEMANTIC_CACHE=true      # Default: true
+export GOOSE_ENABLE_SEMANTIC_CACHE=true       # Default: true
 export GOOSE_ENABLE_PRIORITY_SCHEDULING=true  # Default: true
 export GOOSE_ENABLE_SPECULATIVE_PREFETCH=true # Default: true
 ```
 
 ## How It Works
 
-### Semantic Caching (5.42x)
+### Semantic Caching
 
 Multiple agents asking similar questions get cached responses:
 
 ```
-Agent 1: "What does authenticate() do?"     → LLM call (5s) → cache
+Agent 1: "What does authenticate() do?"      → LLM call → cache
 Agent 2: "Explain the authenticate function" → cache hit (<1ms)
 Agent 3: "How does authenticate work?"       → cache hit (<1ms)
 ```
 
-Uses sentence-transformer embeddings with cosine similarity matching.
+Uses sentence-transformer embeddings (`all-MiniLM-L6-v2`) with cosine similarity matching (threshold: 0.85).
 
-### Priority Scheduling (1.22x)
+### Priority Scheduling
 
 Requests are classified by workflow stage:
 
@@ -112,45 +102,47 @@ Requests are classified by workflow stage:
 | Plan | Warm | "How should I approach..." |
 | Explore | Cold | "What does this file do?" |
 
-Hot agents (blocked, waiting) get served before cold agents (just exploring).
+Hot agents (blocked, waiting) get served before cold agents (exploring).
 
-### Speculative Prefetching (1.90x)
+### Speculative Prefetching
 
-Predicts likely next requests based on workflow:
+Predicts likely next requests based on workflow patterns:
 
 - After `CodeEdit` → prefetch `TestAnalyze`
 - After `TestAnalyze` → prefetch `CodeEdit`
 - After `Plan` → prefetch `CodeEdit`
 
-## Files Added
+## Project Structure
 
 ```
 crates/goose/src/providers/
-├── optimized.rs           # Main optimization wrapper
-├── semantic_cache_store.rs # Pluggable storage backends
-└── mod.rs                  # Updated to include new modules
+├── optimized.rs            # Optimization wrapper
+├── semantic_cache_store.rs # Pluggable storage backends (InMemory, Redis)
+└── mod.rs                  # Module exports
 
-OPTIMIZATION_README.md      # Detailed documentation
+OPTIMIZATIONS.pdf           # Technical documentation
 ```
 
-## Benchmark Results
+## Benchmarks
 
-Tested on Modal A100 with Qwen2.5-Coder-32B-Instruct via vLLM:
+Tested with Qwen2.5-Coder-7B via vLLM on A100:
 
-| Test | Result | Notes |
-|------|--------|-------|
-| Semantic Deduplication | **5.42x** | Real embeddings, 80% hit rate |
-| Speculative Prefetching | **1.90x** | Parallel vs sequential |
-| Priority Scheduling | **1.22x** | Hot agents faster |
-| Context Compression | 0.89x | Not beneficial |
-| Accumulation Window | 1.01x | vLLM already batches |
+| Optimization | Result | Notes |
+|-------------|--------|-------|
+| Semantic Caching | **~3000x** per cache hit | Embeddings + cosine similarity |
+| Priority Scheduling | **1.4x** | Hot-first sequencing |
+| Speculative Prefetch | **2.0x** | Parallel execution |
+
+Optimizations that didn't help:
+- Context compression (0.89x) — generation time dominates
+- Accumulation window (1.01x) — vLLM already batches internally
 
 ## Upstream
 
-This is a fork of [block/goose](https://github.com/block/goose). All original features work as expected. Optimizations are opt-in and only affect self-hosted inference.
+Fork of [block/goose](https://github.com/block/goose). All original features work as expected. Optimizations are opt-in and only affect self-hosted inference.
 
-To sync with upstream:
 ```bash
+# Sync with upstream
 git remote add upstream https://github.com/block/goose.git
 git fetch upstream
 git merge upstream/main
