@@ -1,0 +1,8 @@
+# Temporary ignores for large files
+documentation/blog/
+documentation/static/videos/
+documentation/docs/assets/*.mp4
+documentation/docs/assets/*.gif
+documentation/docs/assets/*.mov
+ui/desktop/src/platform/windows/bin/
+target/
