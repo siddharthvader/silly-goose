@@ -20,7 +20,7 @@ use super::{
     ollama::OllamaProvider,
     openai::OpenAiProvider,
     openrouter::OpenRouterProvider,
-    optimized::{should_optimize, OptimizedProviderConfig},
+    optimized::{should_optimize, EmbeddingSource, OptimizedProviderConfig},
     provider_registry::ProviderRegistry,
     sagemaker_tgi::SageMakerTgiProvider,
     snowflake::SnowflakeProvider,
@@ -164,6 +164,18 @@ pub async fn create(
             cache_ttl_seconds: config
                 .get_param::<u64>("GOOSE_SEMANTIC_CACHE_TTL")
                 .unwrap_or(300),
+            embedding_source: {
+                // Check for OpenAI embeddings config first
+                if let Ok(api_key) = config.get_param::<String>("GOOSE_OPENAI_EMBEDDING_KEY") {
+                    let model = config
+                        .get_param::<String>("GOOSE_OPENAI_EMBEDDING_MODEL")
+                        .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                    EmbeddingSource::OpenAI { api_key, model }
+                } else {
+                    // Default to Auto (try server, fall back to TF-IDF)
+                    EmbeddingSource::Auto
+                }
+            },
         };
 
         // We need to downcast to wrap - this is a limitation of the current architecture
