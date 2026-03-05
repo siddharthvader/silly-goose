@@ -838,6 +838,446 @@ pub fn should_optimize(provider_name: &str) -> bool {
     )
 }
 
+// ============================================================================
+// Dynamic Provider Wrapper (for wrapping Arc<dyn Provider>)
+// ============================================================================
+
+/// Optimized provider that wraps Arc<dyn Provider> directly
+/// This is used by init.rs to wrap providers without knowing the concrete type
+pub struct OptimizedProviderDyn {
+    /// The underlying provider to wrap
+    inner: Arc<dyn Provider>,
+    /// Configuration
+    config: OptimizedProviderConfig,
+    /// Semantic cache (shared across requests)
+    cache: Arc<RwLock<SemanticCache>>,
+    /// Prefetch cache for speculative results
+    prefetch_cache: Arc<RwLock<PrefetchCache>>,
+    /// Priority scheduler
+    scheduler: Arc<PriorityScheduler>,
+    /// Statistics
+    stats: Arc<RwLock<OptimizationStats>>,
+    /// Whether the inner provider supports embeddings (cached)
+    inner_supports_embeddings: bool,
+}
+
+impl OptimizedProviderDyn {
+    /// Create a new optimized provider wrapping the given Arc<dyn Provider>
+    pub fn new(inner: Arc<dyn Provider>, config: OptimizedProviderConfig) -> Self {
+        let inner_supports_embeddings = inner.supports_embeddings();
+        let cache = SemanticCache::new(config.max_cache_entries, config.cache_ttl_seconds);
+        let prefetch_cache = PrefetchCache::new(60);
+        let scheduler = PriorityScheduler::new(MAX_CONCURRENT_HOT, MAX_CONCURRENT_COLD);
+
+        tracing::info!(
+            "Creating OptimizedProviderDyn wrapping {} (semantic_cache={}, priority={}, prefetch={}, embedding_source={:?})",
+            inner.get_name(),
+            config.enable_semantic_cache,
+            config.enable_priority_scheduling,
+            config.enable_speculative_prefetch,
+            config.embedding_source
+        );
+
+        Self {
+            inner,
+            config,
+            cache: Arc::new(RwLock::new(cache)),
+            prefetch_cache: Arc::new(RwLock::new(prefetch_cache)),
+            scheduler: Arc::new(scheduler),
+            stats: Arc::new(RwLock::new(OptimizationStats::default())),
+            inner_supports_embeddings,
+        }
+    }
+
+    /// Create with default configuration
+    pub fn with_defaults(inner: Arc<dyn Provider>) -> Self {
+        Self::new(inner, OptimizedProviderConfig::default())
+    }
+
+    /// Get current statistics
+    pub async fn get_stats(&self) -> OptimizationStats {
+        self.stats.read().await.clone()
+    }
+
+    /// Extract query text from messages for caching
+    fn extract_query_text(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.as_concat_text())
+            .unwrap_or_default()
+    }
+
+    /// Compute embedding using the configured source
+    async fn compute_embedding(&self, text: &str, session_id: &str) -> Vec<f32> {
+        match &self.config.embedding_source {
+            EmbeddingSource::InferenceServer => {
+                self.compute_embedding_from_server(text, session_id).await
+            }
+            EmbeddingSource::OpenAI { api_key, model } => {
+                self.compute_embedding_from_openai(text, api_key, model).await
+            }
+            EmbeddingSource::TfIdfOnly => {
+                Self::compute_tfidf_embedding(text)
+            }
+            EmbeddingSource::Auto => {
+                if self.inner_supports_embeddings {
+                    self.compute_embedding_from_server(text, session_id).await
+                } else {
+                    Self::compute_tfidf_embedding(text)
+                }
+            }
+        }
+    }
+
+    /// Compute embedding from the inference server
+    async fn compute_embedding_from_server(&self, text: &str, session_id: &str) -> Vec<f32> {
+        match self.inner.create_embeddings(session_id, vec![text.to_string()]).await {
+            Ok(embeddings) if !embeddings.is_empty() => {
+                tracing::debug!("Got embedding from inference server");
+                embeddings.into_iter().next().unwrap_or_else(|| Self::compute_tfidf_embedding(text))
+            }
+            Ok(_) => {
+                tracing::debug!("Empty embedding from server, using TF-IDF fallback");
+                Self::compute_tfidf_embedding(text)
+            }
+            Err(e) => {
+                tracing::debug!("Embedding from server failed: {:?}, using TF-IDF fallback", e);
+                Self::compute_tfidf_embedding(text)
+            }
+        }
+    }
+
+    /// Compute embedding from OpenAI API
+    async fn compute_embedding_from_openai(&self, text: &str, api_key: &str, model: &str) -> Vec<f32> {
+        let client = reqwest::Client::new();
+
+        #[derive(serde::Serialize)]
+        struct EmbeddingRequest {
+            input: String,
+            model: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct EmbeddingResponse {
+            data: Vec<EmbeddingData>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct EmbeddingData {
+            embedding: Vec<f32>,
+        }
+
+        let request = EmbeddingRequest {
+            input: text.to_string(),
+            model: model.to_string(),
+        };
+
+        match client
+            .post("https://api.openai.com/v1/embeddings")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&request)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                match response.json::<EmbeddingResponse>().await {
+                    Ok(data) if !data.data.is_empty() => {
+                        tracing::debug!("Got embedding from OpenAI");
+                        data.data.into_iter().next().unwrap().embedding
+                    }
+                    _ => {
+                        tracing::debug!("OpenAI embedding failed, using TF-IDF fallback");
+                        Self::compute_tfidf_embedding(text)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("OpenAI request failed: {:?}, using TF-IDF fallback", e);
+                Self::compute_tfidf_embedding(text)
+            }
+        }
+    }
+
+    /// Compute TF-IDF based embedding (same as generic version)
+    fn compute_tfidf_embedding(text: &str) -> Vec<f32> {
+        let lowercase = text.to_lowercase();
+        let words: Vec<&str> = lowercase
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|w| !w.is_empty() && w.len() > 1)
+            .collect();
+
+        let mut embedding = vec![0.0f32; TFIDF_EMBEDDING_DIM];
+        let total_words = words.len() as f32;
+
+        let mut word_counts: HashMap<&str, usize> = HashMap::new();
+        for word in &words {
+            *word_counts.entry(word).or_insert(0) += 1;
+        }
+
+        for (word, count) in word_counts {
+            let tf = (1.0 + (count as f32).ln()) / total_words.max(1.0);
+            let hash = word.bytes().fold(0u64, |acc, b| {
+                acc.wrapping_mul(31).wrapping_add(b as u64)
+            });
+
+            let idx1 = (hash % TFIDF_EMBEDDING_DIM as u64) as usize;
+            let idx2 = ((hash >> 8) % TFIDF_EMBEDDING_DIM as u64) as usize;
+            let idx3 = ((hash >> 16) % TFIDF_EMBEDDING_DIM as u64) as usize;
+
+            let length_weight = (word.len() as f32).sqrt() / 3.0;
+
+            embedding[idx1] += tf * length_weight;
+            embedding[idx2] += tf * length_weight * 0.5;
+            embedding[idx3] += tf * length_weight * 0.25;
+        }
+
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut embedding {
+                *x /= norm;
+            }
+        }
+
+        embedding
+    }
+
+    /// Start a speculative prefetch in the background
+    fn start_prefetch(
+        &self,
+        stage: WorkflowStage,
+        context: String,
+        model_config: ModelConfig,
+        session_id: String,
+        system: String,
+    ) {
+        if !self.config.enable_speculative_prefetch {
+            return;
+        }
+
+        let Some(prefetch_query) = stage.generate_prefetch_query(&context) else {
+            return;
+        };
+
+        let inner = Arc::clone(&self.inner);
+        let prefetch_cache = Arc::clone(&self.prefetch_cache);
+        let stats = Arc::clone(&self.stats);
+        let predicted_stage = stage.predict_next().unwrap();
+
+        tokio::spawn(async move {
+            let prefetch_msg = Message::new(
+                Role::User,
+                Utc::now().timestamp(),
+                vec![MessageContent::Text(TextContent {
+                    raw: RawTextContent {
+                        text: prefetch_query.clone(),
+                        meta: None,
+                    },
+                    annotations: None,
+                })],
+            );
+
+            match inner.complete(&model_config, &session_id, &system, &[prefetch_msg], &[]).await {
+                Ok((response, usage)) => {
+                    let cache_key = format!("{:?}", predicted_stage);
+                    prefetch_cache.write().await.put(cache_key, response, usage);
+                    tracing::debug!("Prefetch completed for {:?}", predicted_stage);
+                }
+                Err(e) => {
+                    tracing::debug!("Prefetch failed: {:?}", e);
+                }
+            }
+
+            let mut s = stats.write().await;
+            s.prefetch_misses += 1;
+        });
+    }
+}
+
+#[async_trait]
+impl Provider for OptimizedProviderDyn {
+    fn get_name(&self) -> &str {
+        self.inner.get_name()
+    }
+
+    fn get_model_config(&self) -> ModelConfig {
+        self.inner.get_model_config()
+    }
+
+    async fn stream(
+        &self,
+        model_config: &ModelConfig,
+        session_id: &str,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        let stage = WorkflowStage::classify(messages);
+        let priority = stage.priority();
+
+        if self.config.enable_priority_scheduling {
+            let _permit = self.scheduler.acquire(priority).await;
+            self.inner.stream(model_config, session_id, system, messages, tools).await
+        } else {
+            self.inner.stream(model_config, session_id, system, messages, tools).await
+        }
+    }
+
+    async fn complete(
+        &self,
+        model_config: &ModelConfig,
+        session_id: &str,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(Message, ProviderUsage), ProviderError> {
+        let start = Instant::now();
+
+        let stage = WorkflowStage::classify(messages);
+        let priority = stage.priority();
+
+        // Update priority stats
+        {
+            let mut stats = self.stats.write().await;
+            let key = format!("{:?}", priority);
+            *stats.requests_by_priority.entry(key).or_insert(0) += 1;
+        }
+
+        // Check prefetch cache first
+        if self.config.enable_speculative_prefetch {
+            let cache_key = format!("{:?}", stage);
+            if let Some((response, usage)) = self.prefetch_cache.write().await.get(&cache_key) {
+                let mut stats = self.stats.write().await;
+                stats.prefetch_hits += 1;
+                stats.prefetch_misses = stats.prefetch_misses.saturating_sub(1);
+                tracing::info!("Prefetch hit for {:?}", stage);
+                return Ok((response, usage));
+            }
+        }
+
+        // Check semantic cache
+        if self.config.enable_semantic_cache {
+            let query_text = Self::extract_query_text(messages);
+            let query_embedding = self.compute_embedding(&query_text, session_id).await;
+
+            // Update embedding source stat
+            {
+                let mut stats = self.stats.write().await;
+                stats.embedding_source_used = match &self.config.embedding_source {
+                    EmbeddingSource::InferenceServer => "inference_server".to_string(),
+                    EmbeddingSource::OpenAI { .. } => "openai".to_string(),
+                    EmbeddingSource::TfIdfOnly => "tfidf".to_string(),
+                    EmbeddingSource::Auto => {
+                        if self.inner_supports_embeddings {
+                            "auto:inference_server".to_string()
+                        } else {
+                            "auto:tfidf".to_string()
+                        }
+                    }
+                };
+            }
+
+            // Try cache lookup
+            let cached = {
+                let mut cache = self.cache.write().await;
+                cache.get(&query_embedding, self.config.similarity_threshold)
+            };
+
+            if let Some((response, usage, similarity)) = cached {
+                let mut stats = self.stats.write().await;
+                stats.cache_hits += 1;
+                tracing::info!(
+                    "Semantic cache hit for session {} (stage: {:?}, similarity: {:.3})",
+                    session_id,
+                    stage,
+                    similarity
+                );
+                return Ok((response, usage));
+            }
+
+            // Acquire priority permit before calling LLM
+            let _permit = if self.config.enable_priority_scheduling {
+                Some(self.scheduler.acquire(priority).await)
+            } else {
+                None
+            };
+
+            // Cache miss - call the underlying provider
+            let result = self.inner.complete(model_config, session_id, system, messages, tools).await?;
+
+            // Start speculative prefetch
+            self.start_prefetch(
+                stage,
+                query_text.clone(),
+                model_config.clone(),
+                session_id.to_string(),
+                system.to_string(),
+            );
+
+            // Update stats
+            {
+                let mut stats = self.stats.write().await;
+                stats.cache_misses += 1;
+
+                let latency_ms = start.elapsed().as_millis() as f64;
+                match priority {
+                    AgentPriority::Hot => {
+                        let n = stats.requests_by_priority.get("Hot").copied().unwrap_or(1) as f64;
+                        stats.avg_hot_latency_ms = (stats.avg_hot_latency_ms * (n - 1.0) + latency_ms) / n;
+                    }
+                    AgentPriority::Cold => {
+                        let n = stats.requests_by_priority.get("Cold").copied().unwrap_or(1) as f64;
+                        stats.avg_cold_latency_ms = (stats.avg_cold_latency_ms * (n - 1.0) + latency_ms) / n;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Cache the result
+            {
+                let mut cache = self.cache.write().await;
+                cache.put(query_embedding, query_text, result.0.clone(), result.1.clone());
+
+                let mut stats = self.stats.write().await;
+                stats.cache_entries = cache.len();
+            }
+
+            Ok(result)
+        } else {
+            // Caching disabled, just apply priority scheduling and forward
+            let _permit = if self.config.enable_priority_scheduling {
+                Some(self.scheduler.acquire(priority).await)
+            } else {
+                None
+            };
+
+            self.inner.complete(model_config, session_id, system, messages, tools).await
+        }
+    }
+
+    async fn supports_cache_control(&self) -> bool {
+        self.inner.supports_cache_control().await
+    }
+
+    fn supports_embeddings(&self) -> bool {
+        true
+    }
+
+    async fn create_embeddings(
+        &self,
+        session_id: &str,
+        texts: Vec<String>,
+    ) -> Result<Vec<Vec<f32>>, ProviderError> {
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for text in texts {
+            let emb = self.compute_embedding(&text, session_id).await;
+            embeddings.push(emb);
+        }
+        Ok(embeddings)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

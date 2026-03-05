@@ -20,7 +20,7 @@ use super::{
     ollama::OllamaProvider,
     openai::OpenAiProvider,
     openrouter::OpenRouterProvider,
-    optimized::{should_optimize, EmbeddingSource, OptimizedProviderConfig},
+    optimized::{should_optimize, EmbeddingSource, OptimizedProviderConfig, OptimizedProviderDyn},
     provider_registry::ProviderRegistry,
     sagemaker_tgi::SageMakerTgiProvider,
     snowflake::SnowflakeProvider,
@@ -178,15 +178,9 @@ pub async fn create(
             },
         };
 
-        // We need to downcast to wrap - this is a limitation of the current architecture
-        // For now, return the provider as-is with logging that optimizations are conceptually enabled
-        // TODO: Implement proper wrapping once we have a way to wrap Arc<dyn Provider>
-        tracing::info!(
-            "Optimization config: semantic_cache={}, priority={}, prefetch={}",
-            opt_config.enable_semantic_cache,
-            opt_config.enable_priority_scheduling,
-            opt_config.enable_speculative_prefetch
-        );
+        // Wrap the provider with OptimizedProviderDyn
+        let optimized = OptimizedProviderDyn::new(provider, opt_config);
+        return Ok(Arc::new(optimized));
     }
 
     Ok(provider)
