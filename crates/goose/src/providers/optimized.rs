@@ -832,10 +832,29 @@ impl<P: Provider + Send + Sync + 'static> Provider for OptimizedProvider<P> {
 
 /// Check if a provider should use optimizations (i.e., is self-hosted)
 pub fn should_optimize(provider_name: &str) -> bool {
-    matches!(
-        provider_name.to_lowercase().as_str(),
+    let name = provider_name.to_lowercase();
+
+    // Direct match for known self-hosted providers
+    if matches!(
+        name.as_str(),
         "ollama" | "openai-compatible" | "vllm" | "local" | "lm-studio"
-    )
+    ) {
+        return true;
+    }
+
+    // Check if "openai" provider is pointed at a custom host (not api.openai.com)
+    if name == "openai" {
+        if let Ok(host) = std::env::var("OPENAI_HOST") {
+            let host_lower = host.to_lowercase();
+            // If OPENAI_HOST is set to something other than OpenAI's API, treat as self-hosted
+            if !host_lower.contains("api.openai.com") && !host_lower.is_empty() {
+                tracing::info!("OpenAI provider with custom host {} - enabling optimizations", host);
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 // ============================================================================

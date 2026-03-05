@@ -131,11 +131,17 @@ pub async fn create(
     // Optionally wrap self-hosted providers with optimizations
     // Enable via GOOSE_ENABLE_OPTIMIZATIONS=true
     let enable_optimizations = config
-        .get_param::<String>("GOOSE_ENABLE_OPTIMIZATIONS")
-        .map(|v| v.to_lowercase() == "true")
+        .get_param::<bool>("GOOSE_ENABLE_OPTIMIZATIONS")
         .unwrap_or(false);
 
-    if enable_optimizations && should_optimize(name) {
+    let should_opt = should_optimize(name);
+
+    tracing::debug!(
+        "Provider init: {}, enable_optimizations={}, should_optimize={}",
+        name, enable_optimizations, should_opt
+    );
+
+    if enable_optimizations && should_opt {
         tracing::info!(
             "Wrapping {} provider with background-agent optimizations (semantic cache, priority scheduling)",
             name
@@ -144,16 +150,13 @@ pub async fn create(
         // Parse optimization config from environment
         let opt_config = OptimizedProviderConfig {
             enable_semantic_cache: config
-                .get_param::<String>("GOOSE_ENABLE_SEMANTIC_CACHE")
-                .map(|v| v.to_lowercase() != "false")
+                .get_param::<bool>("GOOSE_ENABLE_SEMANTIC_CACHE")
                 .unwrap_or(true),
             enable_priority_scheduling: config
-                .get_param::<String>("GOOSE_ENABLE_PRIORITY_SCHEDULING")
-                .map(|v| v.to_lowercase() != "false")
+                .get_param::<bool>("GOOSE_ENABLE_PRIORITY_SCHEDULING")
                 .unwrap_or(true),
             enable_speculative_prefetch: config
-                .get_param::<String>("GOOSE_ENABLE_SPECULATIVE_PREFETCH")
-                .map(|v| v.to_lowercase() != "false")
+                .get_param::<bool>("GOOSE_ENABLE_SPECULATIVE_PREFETCH")
                 .unwrap_or(true),
             similarity_threshold: config
                 .get_param::<f32>("GOOSE_SEMANTIC_CACHE_THRESHOLD")
