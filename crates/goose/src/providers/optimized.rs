@@ -13,14 +13,16 @@
 
 use super::base::{MessageStream, Provider, ProviderUsage};
 use super::errors::ProviderError;
-use crate::conversation::message::Message;
+use crate::conversation::message::{Message, MessageContent};
+use rmcp::model::TextContent;
 use crate::model::ModelConfig;
 use async_trait::async_trait;
-use rmcp::model::Tool;
+use chrono::Utc;
+use rmcp::model::{RawTextContent, Role, Tool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 /// Minimum cosine similarity threshold for semantic cache hits
 const SIMILARITY_THRESHOLD: f32 = 0.85;
@@ -31,8 +33,14 @@ const MAX_CACHE_ENTRIES: usize = 1000;
 /// Cache entry TTL in seconds
 const CACHE_TTL_SECONDS: u64 = 300;
 
+/// Maximum concurrent hot requests (priority scheduling)
+const MAX_CONCURRENT_HOT: usize = 4;
+
+/// Maximum concurrent cold requests
+const MAX_CONCURRENT_COLD: usize = 2;
+
 /// Priority levels for agent requests
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AgentPriority {
     /// Cold agent - just starting exploratory work, can wait
     Cold = 0,
@@ -81,7 +89,7 @@ impl WorkflowStage {
         if last_user_msg.contains("fix") || last_user_msg.contains("bug") || last_user_msg.contains("edit") {
             return Self::CodeEdit;
         }
-        if last_user_msg.contains("commit") || last_user_msg.contains("message") {
+        if last_user_msg.contains("commit") {
             return Self::CommitMsg;
         }
         if last_user_msg.contains("doc") || last_user_msg.contains("explain") {
@@ -102,12 +110,27 @@ impl WorkflowStage {
         }
     }
 
-    /// Predict the likely next workflow stage
+    /// Predict the likely next workflow stage (for speculative prefetching)
     pub fn predict_next(&self) -> Option<Self> {
         match self {
             Self::CodeEdit => Some(Self::TestAnalyze),
             Self::TestAnalyze => Some(Self::CodeEdit),
             Self::Plan => Some(Self::CodeEdit),
+            _ => None,
+        }
+    }
+
+    /// Generate a prefetch query for the predicted next stage
+    pub fn generate_prefetch_query(&self, context: &str) -> Option<String> {
+        match self.predict_next()? {
+            Self::TestAnalyze => Some(format!(
+                "Based on the code changes, what tests might fail and why?\n\nContext: {}",
+                &context[..context.len().min(500)]
+            )),
+            Self::CodeEdit => Some(format!(
+                "What code changes are needed to fix the issues?\n\nContext: {}",
+                &context[..context.len().min(500)]
+            )),
             _ => None,
         }
     }
@@ -125,6 +148,7 @@ struct CacheEntry {
     /// When this entry was created
     created_at: Instant,
     /// The original query text (for debugging)
+    #[allow(dead_code)]
     query_text: String,
 }
 
@@ -135,6 +159,8 @@ pub struct OptimizationStats {
     pub cache_misses: usize,
     pub cache_entries: usize,
     pub requests_by_priority: HashMap<String, usize>,
+    pub prefetch_hits: usize,
+    pub prefetch_misses: usize,
     pub avg_hot_latency_ms: f64,
     pub avg_cold_latency_ms: f64,
 }
@@ -179,7 +205,7 @@ impl SemanticCache {
     }
 
     /// Look up a cached response for a similar query
-    fn get(&mut self, query_embedding: &[f32], threshold: f32) -> Option<(Message, ProviderUsage)> {
+    fn get(&mut self, query_embedding: &[f32], threshold: f32) -> Option<(Message, ProviderUsage, f32)> {
         self.cleanup_expired();
 
         let mut best_match: Option<(f32, &CacheEntry)> = None;
@@ -193,7 +219,7 @@ impl SemanticCache {
             }
         }
 
-        best_match.map(|(_, entry)| (entry.response.clone(), entry.usage.clone()))
+        best_match.map(|(sim, entry)| (entry.response.clone(), entry.usage.clone(), sim))
     }
 
     /// Add a new entry to the cache
@@ -217,6 +243,81 @@ impl SemanticCache {
     fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Prefetch cache for speculative prefetching results
+struct PrefetchCache {
+    entries: HashMap<String, (Message, ProviderUsage, Instant)>,
+    ttl: Duration,
+}
+
+impl PrefetchCache {
+    fn new(ttl_seconds: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(ttl_seconds),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<(Message, ProviderUsage)> {
+        if let Some((msg, usage, created)) = self.entries.remove(key) {
+            if created.elapsed() < self.ttl {
+                return Some((msg, usage));
+            }
+        }
+        None
+    }
+
+    fn put(&mut self, key: String, response: Message, usage: ProviderUsage) {
+        self.entries.insert(key, (response, usage, Instant::now()));
+    }
+
+    fn cleanup_expired(&mut self) {
+        self.entries.retain(|_, (_, _, created)| created.elapsed() < self.ttl);
+    }
+}
+
+/// Priority-based request scheduler
+struct PriorityScheduler {
+    hot_semaphore: Arc<Semaphore>,
+    cold_semaphore: Arc<Semaphore>,
+}
+
+impl PriorityScheduler {
+    fn new(max_hot: usize, max_cold: usize) -> Self {
+        Self {
+            hot_semaphore: Arc::new(Semaphore::new(max_hot)),
+            cold_semaphore: Arc::new(Semaphore::new(max_cold)),
+        }
+    }
+
+    /// Acquire a permit based on priority. Hot requests get more permits.
+    async fn acquire(&self, priority: AgentPriority) -> PriorityPermit {
+        match priority {
+            AgentPriority::Hot => {
+                let permit = self.hot_semaphore.clone().acquire_owned().await.unwrap();
+                PriorityPermit::Hot(permit)
+            }
+            AgentPriority::Warm => {
+                // Warm tries hot first, falls back to cold
+                if let Ok(permit) = self.hot_semaphore.clone().try_acquire_owned() {
+                    PriorityPermit::Hot(permit)
+                } else {
+                    let permit = self.cold_semaphore.clone().acquire_owned().await.unwrap();
+                    PriorityPermit::Cold(permit)
+                }
+            }
+            AgentPriority::Cold => {
+                let permit = self.cold_semaphore.clone().acquire_owned().await.unwrap();
+                PriorityPermit::Cold(permit)
+            }
+        }
+    }
+}
+
+enum PriorityPermit {
+    Hot(tokio::sync::OwnedSemaphorePermit),
+    Cold(tokio::sync::OwnedSemaphorePermit),
 }
 
 /// Configuration for the optimized provider
@@ -252,23 +353,32 @@ impl Default for OptimizedProviderConfig {
 /// Optimized provider that wraps another provider and adds background-agent optimizations
 pub struct OptimizedProvider<P: Provider> {
     /// The underlying provider to wrap
-    inner: P,
+    inner: Arc<P>,
     /// Configuration
     config: OptimizedProviderConfig,
     /// Semantic cache (shared across requests)
     cache: Arc<RwLock<SemanticCache>>,
+    /// Prefetch cache for speculative results
+    prefetch_cache: Arc<RwLock<PrefetchCache>>,
+    /// Priority scheduler
+    scheduler: Arc<PriorityScheduler>,
     /// Statistics
     stats: Arc<RwLock<OptimizationStats>>,
 }
 
-impl<P: Provider> OptimizedProvider<P> {
+impl<P: Provider + Send + Sync + 'static> OptimizedProvider<P> {
     /// Create a new optimized provider wrapping the given provider
     pub fn new(inner: P, config: OptimizedProviderConfig) -> Self {
         let cache = SemanticCache::new(config.max_cache_entries, config.cache_ttl_seconds);
+        let prefetch_cache = PrefetchCache::new(60); // 60 second TTL for prefetch
+        let scheduler = PriorityScheduler::new(MAX_CONCURRENT_HOT, MAX_CONCURRENT_COLD);
+
         Self {
-            inner,
+            inner: Arc::new(inner),
             config,
             cache: Arc::new(RwLock::new(cache)),
+            prefetch_cache: Arc::new(RwLock::new(prefetch_cache)),
+            scheduler: Arc::new(scheduler),
             stats: Arc::new(RwLock::new(OptimizationStats::default())),
         }
     }
@@ -293,18 +403,17 @@ impl<P: Provider> OptimizedProvider<P> {
             .unwrap_or_default()
     }
 
-    /// Compute a simple embedding for the query
-    /// In production, this would use a proper embedding model like sentence-transformers
-    /// For now, we use a bag-of-words approach as a placeholder
+    /// Compute embedding for the query
+    /// NOTE: This is a placeholder. In production, integrate with a real embedding model
+    /// like sentence-transformers via Python bindings or an embedding API.
     fn compute_embedding(text: &str) -> Vec<f32> {
-        // Simple bag-of-words embedding (placeholder for real embeddings)
-        // In production, you'd call an embedding model here
+        // Placeholder: bag-of-words embedding
+        // TODO: Replace with real embedding model integration
         let lowercase = text.to_lowercase();
         let words: Vec<&str> = lowercase.split_whitespace().collect();
-        let mut embedding = vec![0.0f32; 384]; // Match sentence-transformers dimension
+        let mut embedding = vec![0.0f32; 384];
 
         for (i, word) in words.iter().enumerate() {
-            // Simple hash-based embedding
             let hash = word.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
             let idx = (hash % 384) as usize;
             embedding[idx] += 1.0 / (i + 1) as f32;
@@ -320,10 +429,64 @@ impl<P: Provider> OptimizedProvider<P> {
 
         embedding
     }
+
+    /// Start a speculative prefetch in the background
+    fn start_prefetch(
+        &self,
+        stage: WorkflowStage,
+        context: String,
+        model_config: ModelConfig,
+        session_id: String,
+        system: String,
+    ) {
+        if !self.config.enable_speculative_prefetch {
+            return;
+        }
+
+        let Some(prefetch_query) = stage.generate_prefetch_query(&context) else {
+            return;
+        };
+
+        let inner = Arc::clone(&self.inner);
+        let prefetch_cache = Arc::clone(&self.prefetch_cache);
+        let stats = Arc::clone(&self.stats);
+        let predicted_stage = stage.predict_next().unwrap();
+
+        tokio::spawn(async move {
+            // Create a simple prefetch message
+            let prefetch_msg = Message::new(
+                Role::User,
+                Utc::now().timestamp(),
+                vec![MessageContent::Text(TextContent {
+                    raw: RawTextContent {
+                        text: prefetch_query.clone(),
+                        meta: None,
+                    },
+                    annotations: None,
+                })],
+            );
+
+            // Execute prefetch request
+            match inner.complete(&model_config, &session_id, &system, &[prefetch_msg], &[]).await {
+                Ok((response, usage)) => {
+                    let cache_key = format!("{:?}", predicted_stage);
+                    prefetch_cache.write().await.put(cache_key, response, usage);
+                    tracing::debug!("Prefetch completed for {:?}", predicted_stage);
+                }
+                Err(e) => {
+                    tracing::debug!("Prefetch failed: {:?}", e);
+                }
+            }
+
+            // Update stats
+            let mut s = stats.write().await;
+            s.prefetch_misses += 1; // Will be corrected to hit if used
+        });
+    }
 }
 
 #[async_trait]
-impl<P: Provider + 'static> Provider for OptimizedProvider<P> {
+impl<P: Provider + Send + Sync + 'static> Provider for OptimizedProvider<P> {
     fn get_name(&self) -> &str {
         self.inner.get_name()
     }
@@ -341,8 +504,16 @@ impl<P: Provider + 'static> Provider for OptimizedProvider<P> {
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         // For streaming, we don't cache (would break streaming semantics)
-        // Just pass through to inner provider
-        self.inner.stream(model_config, session_id, system, messages, tools).await
+        // But we still apply priority scheduling
+        let stage = WorkflowStage::classify(messages);
+        let priority = stage.priority();
+
+        if self.config.enable_priority_scheduling {
+            let _permit = self.scheduler.acquire(priority).await;
+            self.inner.stream(model_config, session_id, system, messages, tools).await
+        } else {
+            self.inner.stream(model_config, session_id, system, messages, tools).await
+        }
     }
 
     async fn complete(
@@ -366,6 +537,18 @@ impl<P: Provider + 'static> Provider for OptimizedProvider<P> {
             *stats.requests_by_priority.entry(key).or_insert(0) += 1;
         }
 
+        // Check prefetch cache first (speculative prefetching)
+        if self.config.enable_speculative_prefetch {
+            let cache_key = format!("{:?}", stage);
+            if let Some((response, usage)) = self.prefetch_cache.write().await.get(&cache_key) {
+                let mut stats = self.stats.write().await;
+                stats.prefetch_hits += 1;
+                stats.prefetch_misses = stats.prefetch_misses.saturating_sub(1);
+                tracing::info!("Prefetch hit for {:?}", stage);
+                return Ok((response, usage));
+            }
+        }
+
         // Check semantic cache if enabled
         if self.config.enable_semantic_cache {
             let query_text = Self::extract_query_text(messages);
@@ -377,20 +560,37 @@ impl<P: Provider + 'static> Provider for OptimizedProvider<P> {
                 cache.get(&query_embedding, self.config.similarity_threshold)
             };
 
-            if let Some((response, usage)) = cached {
+            if let Some((response, usage, similarity)) = cached {
                 // Cache hit!
                 let mut stats = self.stats.write().await;
                 stats.cache_hits += 1;
                 tracing::info!(
-                    "Semantic cache hit for session {} (stage: {:?})",
+                    "Semantic cache hit for session {} (stage: {:?}, similarity: {:.3})",
                     session_id,
-                    stage
+                    stage,
+                    similarity
                 );
                 return Ok((response, usage));
             }
 
+            // Acquire priority permit before calling LLM
+            let _permit = if self.config.enable_priority_scheduling {
+                Some(self.scheduler.acquire(priority).await)
+            } else {
+                None
+            };
+
             // Cache miss - call the underlying provider
             let result = self.inner.complete(model_config, session_id, system, messages, tools).await?;
+
+            // Start speculative prefetch for predicted next stage
+            self.start_prefetch(
+                stage,
+                query_text.clone(),
+                model_config.clone(),
+                session_id.to_string(),
+                system.to_string(),
+            );
 
             // Update stats
             {
@@ -422,7 +622,13 @@ impl<P: Provider + 'static> Provider for OptimizedProvider<P> {
 
             Ok(result)
         } else {
-            // Caching disabled, just forward
+            // Caching disabled, just apply priority scheduling and forward
+            let _permit = if self.config.enable_priority_scheduling {
+                Some(self.scheduler.acquire(priority).await)
+            } else {
+                None
+            };
+
             self.inner.complete(model_config, session_id, system, messages, tools).await
         }
     }
@@ -458,7 +664,6 @@ mod tests {
 
     #[test]
     fn test_workflow_stage_classification() {
-        // We can't easily test without Message, but we can test the stage logic
         assert_eq!(WorkflowStage::TestAnalyze.priority(), AgentPriority::Hot);
         assert_eq!(WorkflowStage::CodeEdit.priority(), AgentPriority::Hot);
         assert_eq!(WorkflowStage::Explore.priority(), AgentPriority::Cold);
@@ -469,7 +674,16 @@ mod tests {
     fn test_workflow_prediction() {
         assert_eq!(WorkflowStage::CodeEdit.predict_next(), Some(WorkflowStage::TestAnalyze));
         assert_eq!(WorkflowStage::TestAnalyze.predict_next(), Some(WorkflowStage::CodeEdit));
+        assert_eq!(WorkflowStage::Plan.predict_next(), Some(WorkflowStage::CodeEdit));
         assert_eq!(WorkflowStage::Explore.predict_next(), None);
+    }
+
+    #[test]
+    fn test_prefetch_query_generation() {
+        let context = "def add(a, b): return a + b";
+        assert!(WorkflowStage::CodeEdit.generate_prefetch_query(context).is_some());
+        assert!(WorkflowStage::TestAnalyze.generate_prefetch_query(context).is_some());
+        assert!(WorkflowStage::Explore.generate_prefetch_query(context).is_none());
     }
 
     #[test]
@@ -496,31 +710,66 @@ mod tests {
     }
 
     #[test]
+    fn test_semantic_cache_operations() {
+        use super::super::base::Usage;
+
+        let mut cache = SemanticCache::new(10, 300);
+
+        // Create a mock message and usage
+        let embedding = vec![1.0, 0.0, 0.0];
+        let response = Message::new(Role::Assistant, 0, vec![]);
+        let usage = ProviderUsage::new("test".to_string(), Usage::default());
+
+        // Put and get
+        cache.put(embedding.clone(), "test query".to_string(), response.clone(), usage.clone());
+        assert_eq!(cache.len(), 1);
+
+        // Should hit with same embedding
+        let result = cache.get(&embedding, 0.85);
+        assert!(result.is_some());
+
+        // Should miss with orthogonal embedding
+        let orthogonal = vec![0.0, 1.0, 0.0];
+        let result = cache.get(&orthogonal, 0.85);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_prefetch_cache_operations() {
+        use super::super::base::Usage;
+
+        let mut cache = PrefetchCache::new(60);
+
+        let response = Message::new(Role::Assistant, 0, vec![]);
+        let usage = ProviderUsage::new("test".to_string(), Usage::default());
+
+        cache.put("TestAnalyze".to_string(), response, usage);
+
+        // Should hit
+        assert!(cache.get("TestAnalyze").is_some());
+
+        // Should miss (already consumed)
+        assert!(cache.get("TestAnalyze").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_priority_scheduler() {
+        let scheduler = PriorityScheduler::new(2, 1);
+
+        // Hot should get permit immediately
+        let _permit1 = scheduler.acquire(AgentPriority::Hot).await;
+        let _permit2 = scheduler.acquire(AgentPriority::Hot).await;
+
+        // Third hot should still work (semaphore)
+        // Cold should work with cold semaphore
+        let _permit3 = scheduler.acquire(AgentPriority::Cold).await;
+    }
+
+    #[test]
     fn test_compute_embedding() {
-        // Test the embedding function directly
-        fn compute_embedding(text: &str) -> Vec<f32> {
-            let lowercase = text.to_lowercase();
-            let words: Vec<&str> = lowercase.split_whitespace().collect();
-            let mut embedding = vec![0.0f32; 384];
-
-            for (i, word) in words.iter().enumerate() {
-                let hash = word.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-                let idx = (hash % 384) as usize;
-                embedding[idx] += 1.0 / (i + 1) as f32;
-            }
-
-            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for x in &mut embedding {
-                    *x /= norm;
-                }
-            }
-            embedding
-        }
-
-        let emb1 = compute_embedding("hello world");
-        let emb2 = compute_embedding("hello world");
-        let emb3 = compute_embedding("goodbye moon");
+        let emb1 = OptimizedProvider::<DummyProvider>::compute_embedding("hello world");
+        let emb2 = OptimizedProvider::<DummyProvider>::compute_embedding("hello world");
+        let emb3 = OptimizedProvider::<DummyProvider>::compute_embedding("goodbye moon");
 
         // Same text should produce same embedding
         assert_eq!(emb1, emb2);
@@ -531,5 +780,24 @@ mod tests {
         // Should be normalized (length ~= 1)
         let norm: f32 = emb1.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01);
+    }
+
+    // Dummy provider for testing compute_embedding
+    struct DummyProvider;
+
+    #[async_trait]
+    impl Provider for DummyProvider {
+        fn get_name(&self) -> &str { "dummy" }
+        fn get_model_config(&self) -> ModelConfig {
+            ModelConfig::new("test").expect("test config")
+        }
+        async fn stream(&self, _: &ModelConfig, _: &str, _: &str, _: &[Message], _: &[Tool])
+            -> Result<MessageStream, ProviderError> { unimplemented!() }
+        async fn complete(&self, _: &ModelConfig, _: &str, _: &str, _: &[Message], _: &[Tool])
+            -> Result<(Message, ProviderUsage), ProviderError> { unimplemented!() }
+        async fn supports_cache_control(&self) -> bool { false }
+        fn supports_embeddings(&self) -> bool { false }
+        async fn create_embeddings(&self, _: &str, _: Vec<String>)
+            -> Result<Vec<Vec<f32>>, ProviderError> { unimplemented!() }
     }
 }
